@@ -67,9 +67,10 @@ PLATFORMS = (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Home Assistant's coordinator logs the first failed poll at ERROR and stays
-# quiet until the next success. Timeouts, connection errors, and 5xx responses
-# are expected while the Leviton cloud blips, so those messages are warnings.
+# Home Assistant's coordinator logs UpdateFailed at ERROR. Timeouts,
+# connection errors, and 5xx responses are expected cloud blips. This
+# integration logs the first of those at warning and the rest at debug, so
+# the coordinator copy is kept at debug and does not add a second warning.
 _TRANSIENT_COORDINATOR_MESSAGES = frozenset(
     {
         "Error fetching %s data: %s",
@@ -78,9 +79,13 @@ _TRANSIENT_COORDINATOR_MESSAGES = frozenset(
     }
 )
 
+# Later polls may fail this many times in a row and still serve the last
+# good snapshot. The next failure raises UpdateFailed.
+MAX_TOLERATED_UPDATE_FAILURES = 2
+
 
 class _DowngradeTransientCoordinatorLogs(logging.Filter):
-    """Downgrade expected cloud-fault logs from the data update coordinator."""
+    """Keep expected cloud-fault logs from the coordinator at debug."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Return True so the record is kept, after adjusting its level."""
@@ -88,8 +93,8 @@ class _DowngradeTransientCoordinatorLogs(logging.Filter):
             record.levelno >= logging.ERROR
             and record.msg in _TRANSIENT_COORDINATOR_MESSAGES
         ):
-            record.levelno = logging.WARNING
-            record.levelname = logging.getLevelName(logging.WARNING)
+            record.levelno = logging.DEBUG
+            record.levelname = logging.getLevelName(logging.DEBUG)
         return True
 
 
@@ -195,18 +200,22 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         },
     )
 
+    consecutive_failures = 0
+
     async def async_update_data() -> LevitonData:
         """Fetch data from API endpoint.
 
         This is the place to pre-process the data to lookup tables
         so entities can quickly look up their data.
         """
+        nonlocal consecutive_failures
+
         try:
             async with timeout(conf_timeout):
                 result = await hass.async_add_executor_job(api.update, conf_residences)
         except LevitonAuthError as exception:
-            # Stop polling and prompt the user to reauthenticate rather than
-            # retrying a login that cannot succeed (for example a used 2FA code).
+            # Auth is not a transient cloud blip. Do not spend the grace
+            # period replaying a login that cannot succeed.
             _async_persist_refreshed_auth(hass, config_entry, api)
             raise ConfigEntryAuthFailed(exception.message) from exception
         except (
@@ -217,6 +226,24 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             # A refreshed bearer is worth keeping even when the data fetch
             # itself failed, so the next retry does not log in again.
             _async_persist_refreshed_auth(hass, config_entry, api)
+            consecutive_failures += 1
+            # The first refresh has no snapshot to serve, so it fails
+            # immediately and setup becomes ConfigEntryNotReady. Later polls
+            # keep the last good data for two failures.
+            have_snapshot = coordinator.data is not None
+            within_grace = (
+                have_snapshot and consecutive_failures <= MAX_TOLERATED_UPDATE_FAILURES
+            )
+            _LOGGER.log(
+                logging.WARNING if consecutive_failures == 1 else logging.DEBUG,
+                "Leviton update failed (%s of %s tolerated)%s: %s",
+                consecutive_failures,
+                MAX_TOLERATED_UPDATE_FAILURES,
+                ", serving last known data" if within_grace else "",
+                exception,
+            )
+            if within_grace:
+                return coordinator.data
             if isinstance(exception, LevitonException):
                 raise UpdateFailed(
                     "Error communicating with API, "
@@ -228,6 +255,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
                 f"Error communicating with API: {exception!r}"
             ) from exception
 
+        consecutive_failures = 0
         _async_persist_refreshed_auth(hass, config_entry, api)
         return result
 

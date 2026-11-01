@@ -33,7 +33,7 @@ This repository is a personal fork of [schmittx/home-assistant-leviton-decora-sm
 3. Restart Home Assistant.
 4. The existing entry should load on its own. A reauthentication prompt appears only when the saved login is rejected (expired token, or two-factor authentication that cannot be refreshed with the stored password). A one-time 2FA code is not reused.
 
-Version 2.3.0 is a reliability release. See `CHANGELOG.md`.
+Version 2.3.0 is a reliability release. After startup, a timeout, connection error, or HTTP 5xx keeps the last good state for two polls and marks entities unavailable on the third. A failed login still asks you to reauthenticate immediately. See `CHANGELOG.md`.
 
 ## Install
 1. Ensure Home Assistant is updated to version 2026.8.0 or newer.

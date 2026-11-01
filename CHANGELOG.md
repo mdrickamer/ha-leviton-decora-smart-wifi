@@ -11,9 +11,9 @@ Reliability release based on upstream 2.2.2. The domain is unchanged (`leviton_d
 - The one-time 2FA code is not stored and is not sent on an automatic re-login. Accounts with 2FA need the reauthentication prompt after the bearer expires. That is intentional: replaying the old code only counts toward Leviton's lockout.
 
 ### Startup and cloud errors
-- Setup uses `async_config_entry_first_refresh`. A timeout, connection error, or HTTP 5xx at startup raises `ConfigEntryNotReady` and Home Assistant retries, instead of aborting setup or creating no entities.
-- The same faults during a later poll raise `UpdateFailed`, so entities go unavailable and return on the next successful poll.
-- Those expected faults are logged at warning (the first failure) or debug, not as an error on every poll.
+- Setup uses `async_config_entry_first_refresh`. A timeout, connection error, or HTTP 5xx at startup raises `ConfigEntryNotReady` and Home Assistant retries. There is no grace period on that first refresh, because there is no last good snapshot yet.
+- The same faults during a later poll keep the last good data for two consecutive failures. Entities stay available with that state. The third consecutive failure raises `UpdateFailed` and entities go unavailable until a poll succeeds. Any successful poll resets the counter. An authentication failure does not use this grace period.
+- The first transient failure is logged at warning. Further ones are debug, so a long outage does not log an error on every poll.
 
 ### Devices, secrets, and small fixes
 - The device page can delete a device only when the My Leviton account no longer reports it.

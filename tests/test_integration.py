@@ -168,23 +168,74 @@ async def test_first_refresh_not_ready(hass, api_behavior, error) -> None:
     assert _switch_entity_id(hass, f"{RESIDENCE_ID}-{DEVICE_ID}-switch") is None
 
 
-async def test_midrun_502_marks_unavailable_then_recovers(hass, api_behavior) -> None:
-    """A 502 after startup makes entities unavailable until the next good poll."""
+def _transient_failure_records(caplog) -> list[logging.LogRecord]:
+    """Return the integration's grace-period failure logs."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "custom_components.leviton_decora_smart_wifi"
+        and record.getMessage().startswith("Leviton update failed")
+    ]
+
+
+async def _refresh(hass, entry) -> None:
+    coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+
+async def test_transient_502s_use_two_poll_grace_then_recover(
+    hass, api_behavior, caplog
+) -> None:
+    """Two 502s keep the last state. The third marks entities unavailable.
+
+    A successful poll resets the counter, so two further 502s stay available.
+    """
+    caplog.set_level(logging.DEBUG)
+    entry = _entry()
+    assert await _setup(hass, entry, api_behavior)
+    entity_id = _switch_entity_id(hass, f"{RESIDENCE_ID}-{DEVICE_ID}-switch")
+    original = hass.states.get(entity_id).state
+    assert original != STATE_UNAVAILABLE
+
+    api_behavior.update_error = LevitonException(502, "BadGateway", "bad gateway")
+    await _refresh(hass, entry)
+    await _refresh(hass, entry)
+    assert hass.states.get(entity_id).state == original
+
+    await _refresh(hass, entry)
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+    failures = _transient_failure_records(caplog)
+    assert [record.levelno for record in failures] == [
+        logging.WARNING,
+        logging.DEBUG,
+        logging.DEBUG,
+    ]
+
+    api_behavior.update_error = None
+    await _refresh(hass, entry)
+    assert hass.states.get(entity_id).state == original
+
+    api_behavior.update_error = LevitonException(502, "BadGateway", "bad gateway")
+    await _refresh(hass, entry)
+    await _refresh(hass, entry)
+    assert hass.states.get(entity_id).state == original
+
+
+async def test_auth_failure_bypasses_grace(hass, api_behavior) -> None:
+    """An auth failure marks entities unavailable on the first poll."""
     entry = _entry()
     assert await _setup(hass, entry, api_behavior)
     entity_id = _switch_entity_id(hass, f"{RESIDENCE_ID}-{DEVICE_ID}-switch")
     assert hass.states.get(entity_id).state != STATE_UNAVAILABLE
 
-    api_behavior.update_error = LevitonException(502, "BadGateway", "bad gateway")
-    coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+    api_behavior.update_error = LevitonAuthError(LoginResult.FAILED)
+    await _refresh(hass, entry)
 
-    api_behavior.update_error = None
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert hass.states.get(entity_id).state != STATE_UNAVAILABLE
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+    flows = hass.config_entries.flow.async_progress()
+    assert any(flow["context"]["source"] == SOURCE_REAUTH for flow in flows)
 
 
 async def test_refreshed_token_is_saved_on_the_entry(hass, api_behavior) -> None:
