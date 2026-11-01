@@ -5,6 +5,7 @@ from http import HTTPMethod
 import json
 import logging
 from pathlib import Path
+import threading
 from typing import Any
 
 import requests
@@ -19,6 +20,23 @@ _LOGGER = logging.getLogger(__name__)
 # connection blocks the whole update cycle until the coordinator gives up,
 # marking every entity unavailable for a full scan interval.
 REQUEST_TIMEOUT = (5, 10)
+
+_REDACTED = "**REDACTED**"
+# Written by the "save responses" debug option. These keys (and any value
+# equal to the live bearer) are replaced so a login token or password cannot
+# land on disk.
+_SECRET_KEYS = frozenset(
+    {
+        "accesstoken",
+        "access_token",
+        "authorization",
+        "code",
+        "password",
+        "refresh_token",
+        "refreshtoken",
+        "token",
+    }
+)
 
 
 class LevitonData:
@@ -48,11 +66,35 @@ class LevitonException(Exception):
         self.status_code = status_code
         self.name = name
         self.message = message
-        _LOGGER.error(
+        # Expected faults (expired token, 2FA, 5xx, lockout) used to be logged
+        # at ERROR on every poll. Callers decide the user-visible severity.
+        _LOGGER.debug(
             "\n- LevitonException\n- Status: %s\n- Name: %s\n- Message: %s",
             self.status_code,
             self.name,
             self.message,
+        )
+
+
+class LevitonAuthError(LevitonException):
+    """Raised when the token is rejected and re-login cannot succeed.
+
+    A stored 2FA code is single use, so replaying it after the token expires
+    fails and each attempt counts toward Leviton's lockout. Callers turn this
+    into ConfigEntryAuthFailed and ask the user to sign in again.
+    """
+
+    def __init__(self, result: LoginResult | None = None) -> None:
+        """Initialize."""
+        self.result = result
+        super().__init__(
+            status_code=401,
+            name="AuthenticationFailed",
+            message=(
+                f"Re-login failed: {result}"
+                if result
+                else "Token rejected and no credentials stored"
+            ),
         )
 
 
@@ -71,10 +113,22 @@ class LevitonAPI:
         self.save_location = save_location
         self.user_id = user_id
 
-        self.credentials: dict = credentials or {}
+        self.credentials: dict = {
+            key: value
+            for key, value in (credentials or {}).items()
+            if key != "code" and value is not None
+        }
         self.is_logging_in: bool = False
         self.data: LevitonData = LevitonData()
         self.session = requests.Session()
+        # requests.Session is shared by polling and service calls and is not
+        # thread-safe. The lock covers one request at a time. It is not held
+        # across refresh()'s re-login, which calls back into call().
+        # A per-command partial refresh (instead of rebuilding the whole
+        # account on coordinator.async_request_refresh) was considered and
+        # intentionally not implemented; state still arrives on the next poll
+        # or websocket push.
+        self._session_lock = threading.Lock()
         self.user_name: str | None = None
         self.login_response: dict[str, Any] | None = None
 
@@ -99,12 +153,13 @@ class LevitonAPI:
             request_headers = dict(headers)
             if self.authorization:
                 request_headers["authorization"] = self.authorization
-            return self.session.request(
-                method=method,
-                url=f"{API_ENDPOINT}/{url}",
-                headers=request_headers,
-                **kwargs,
-            )
+            with self._session_lock:
+                return self.session.request(
+                    method=method,
+                    url=f"{API_ENDPOINT}/{url}",
+                    headers=request_headers,
+                    **kwargs,
+                )
 
         response = self.refresh(send_request)
         response = self.parse_response(response=response)
@@ -113,6 +168,16 @@ class LevitonAPI:
 
     def login(self, email: str, password: str, code: str | None = None) -> LoginResult:
         """Login."""
+        # A rejected login is a 401 itself. is_logging_in stops refresh()
+        # from treating that 401 as an expired token and logging in again.
+        self.is_logging_in = True
+        try:
+            return self._login(email, password, code)
+        finally:
+            self.is_logging_in = False
+
+    def _login(self, email: str, password: str, code: str | None) -> LoginResult:
+        """Send the login request and classify the result."""
         try:
             data = {"email": email, "password": password}
             if code:
@@ -162,7 +227,9 @@ class LevitonAPI:
             ):
                 return LoginResult.CODE_INVALID
             return LoginResult.FAILED
-        self.credentials = data
+        # The 2FA code is single use. Keep the password so a later refresh can
+        # re-login, but never the code.
+        self.credentials = {"email": email, "password": password}
         return LoginResult.SUCCESS
 
     def decode_body(self, response: requests.Response) -> Any:
@@ -207,12 +274,12 @@ class LevitonAPI:
         """
         try:
             response = function()
-        except requests.exceptions.ConnectionError, requests.exceptions.Timeout:
-            _LOGGER.warning(
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            _LOGGER.debug(
                 "Leviton REST connection dropped or timed out; retrying with"
                 " fresh session"
             )
-            self.session = requests.Session()
+            self._reset_session()
             response = function()
 
         if response.status_code != 200:
@@ -221,7 +288,7 @@ class LevitonAPI:
             # A non-JSON error body is a transient cloud fault. Retry once
             # here rather than failing the whole update cycle.
             if text is None:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "Leviton returned a non-JSON body (status %s); retrying once",
                     response.status_code,
                 )
@@ -234,32 +301,33 @@ class LevitonAPI:
             # rather than "Invalid Access Token", so matching on the message
             # text never fired and an expired token was reused indefinitely.
             # is_logging_in stops recursion, since login() calls call().
-            if all(
-                [
-                    response.status_code == 401,
-                    not self.is_logging_in,
-                    self.credentials.get("email"),
-                    self.credentials.get("password"),
-                ]
-            ):
+            # The stored 2FA code is not sent: it is single use, and replaying
+            # it only burns attempts toward the account lockout.
+            if response.status_code == 401 and not self.is_logging_in:
+                email = self.credentials.get("email")
+                password = self.credentials.get("password")
+                if not email or not password:
+                    raise LevitonAuthError
+
                 _LOGGER.debug(
                     "Leviton rejected the token (%s); re-authenticating",
                     error.get("message"),
                 )
-                self.is_logging_in = True
-
-                try:
-                    self.login(
-                        email=self.credentials["email"],
-                        password=self.credentials["password"],
-                        code=self.credentials.get("code"),
-                    )
-                finally:
-                    self.is_logging_in = False
+                result = self.login(email=email, password=password)
+                if result != LoginResult.SUCCESS:
+                    raise LevitonAuthError(result)
 
                 response = function()
+                if response.status_code == 401:
+                    raise LevitonAuthError(LoginResult.FAILED)
 
         return response
+
+    def _reset_session(self) -> None:
+        """Replace the pooled session after a dropped connection."""
+        with self._session_lock:
+            self.session.close()
+            self.session = requests.Session()
 
     def save_response(
         self, response: dict[str, Any] | None, name: str = "response"
@@ -269,18 +337,50 @@ class LevitonAPI:
             if not Path(self.save_location).is_dir():
                 _LOGGER.debug("Creating directory: %s", self.save_location)
                 Path(self.save_location).mkdir()
-            name = name.replace("/", "_").replace(".", "_")
-            file_path_name = f"{self.save_location}/{name}.json"
+            safe_name = name.replace("/", "_").replace(".", "_")
+            file_path_name = f"{self.save_location}/{safe_name}.json"
             _LOGGER.debug("Saving response: %s", file_path_name)
+            payload = self._redact_saved_payload(
+                response, login_response="login" in name
+            )
             with Path(file_path_name).open(mode="w", encoding="utf-8") as file:
                 json.dump(
-                    obj=response,
+                    obj=payload,
                     fp=file,
                     indent=4,
                     default=lambda o: "not-serializable",
                     sort_keys=True,
                 )
-            file.close()
+
+    def _redact_saved_payload(
+        self, value: Any, *, login_response: bool = False
+    ) -> Any:
+        """Remove login tokens and passwords before a debug dump is written."""
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                if self._is_saved_secret(key, item, login_bearer=login_response):
+                    redacted[key] = _REDACTED
+                else:
+                    redacted[key] = self._redact_saved_payload(item)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_saved_payload(item) for item in value]
+        if isinstance(value, str) and self.authorization and value == self.authorization:
+            return _REDACTED
+        return value
+
+    def _is_saved_secret(self, key: Any, item: Any, *, login_bearer: bool) -> bool:
+        """Return True if this field would persist a login secret."""
+        if str(key).lower() in _SECRET_KEYS:
+            return True
+        # person/login returns the bearer as top-level "id", and that id is
+        # not yet stored on self.authorization when the response is saved.
+        if login_bearer and key == "id":
+            return True
+        return bool(
+            isinstance(item, str) and self.authorization and item == self.authorization
+        )
 
     def update(self, target_residences: list[int] | None = None) -> LevitonData:
         """Update."""
@@ -289,7 +389,22 @@ class LevitonAPI:
             data["residences"] = self.get_residences(target_residences)
             data["firmware"] = self.get_firmware(data["residences"])
             self.data = LevitonData(data)
-        except LevitonException:
+        except LevitonAuthError:
+            # Returning stale data here hides an expired login forever.
+            raise
+        except LevitonException as exception:
+            # 5xx (and a token that is still rejected after re-login) must
+            # reach the coordinator. Swallowing them used to look like a
+            # successful poll with empty or stale data.
+            if exception.status_code == 401 or exception.status_code >= 500:
+                if exception.status_code == 401:
+                    raise LevitonAuthError from exception
+                raise
+            _LOGGER.debug(
+                "Leviton update failed with status %s: %s",
+                exception.status_code,
+                exception.message,
+            )
             return self.data
         return self.data
 
