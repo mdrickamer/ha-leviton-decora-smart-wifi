@@ -18,12 +18,13 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import LevitonAPI, LevitonData, LevitonException
+from .api import LevitonAPI, LevitonAuthError, LevitonData, LevitonException
 from .api.websocket import LevitonWebSocket
 from .config_flow import LevitonConfigFlow
 from .const import (
@@ -47,7 +48,7 @@ from .const import (
     ScanInterval,
     Timeout,
 )
-from .util import generate_device_identifier
+from .util import generate_device_identifier, login_response_for_storage
 
 PLATFORMS = (
     Platform.BINARY_SENSOR,
@@ -66,10 +67,38 @@ PLATFORMS = (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Consecutive failed polls tolerated before entities are marked unavailable.
-# Home Assistant blanks every entity as soon as one update fails, so without
-# this a single transient fault costs a full scan interval of downtime.
+# Home Assistant's coordinator logs UpdateFailed at ERROR. Timeouts,
+# connection errors, and 5xx responses are expected cloud blips. This
+# integration logs the first of those at warning and the rest at debug, so
+# the coordinator copy is kept at debug and does not add a second warning.
+_TRANSIENT_COORDINATOR_MESSAGES = frozenset(
+    {
+        "Error fetching %s data: %s",
+        "Error requesting %s data: %s",
+        "Timeout fetching %s data",
+    }
+)
+
+# Later polls may fail this many times in a row and still serve the last
+# good snapshot. The next failure raises UpdateFailed.
 MAX_TOLERATED_UPDATE_FAILURES = 2
+
+
+class _DowngradeTransientCoordinatorLogs(logging.Filter):
+    """Keep expected cloud-fault logs from the coordinator at debug."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return True so the record is kept, after adjusting its level."""
+        if (
+            record.levelno >= logging.ERROR
+            and record.msg in _TRANSIENT_COORDINATOR_MESSAGES
+        ):
+            record.levelno = logging.DEBUG
+            record.levelname = logging.getLevelName(logging.DEBUG)
+        return True
+
+
+_LOGGER.addFilter(_DowngradeTransientCoordinatorLogs())
 
 
 class LevitonDataUpdateCoordinator(DataUpdateCoordinator[LevitonData]):
@@ -92,15 +121,13 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
         data = dict(config_entry.data)
         options = dict(config_entry.options)
-        _LOGGER.debug("Initial data:\n%s", data)
-        _LOGGER.debug("Initial options:\n%s", options)
+        # Do not log data or options. Both can contain the password, bearer,
+        # and 2FA code.
 
         if config_entry.version <= 1:
             data[CONF_SCAN_INTERVAL] = ScanInterval.DEFAULT
             options[CONF_SCAN_INTERVAL] = ScanInterval.DEFAULT
-
-        _LOGGER.debug("Migrated data:\n%s", data)
-        _LOGGER.debug("Migrated options:\n%s", options)
+        data.pop(CONF_CODE, None)
 
         hass.config_entries.async_update_entry(
             entry=config_entry,
@@ -165,10 +192,11 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         authorization=data[CONF_TOKEN],
         # Without these, refresh() cannot re-authenticate when the stored
         # token is rejected, and every entity stays unavailable forever.
+        # Password is kept so an expired bearer can be refreshed. The 2FA
+        # code is not: it is single use and must not be replayed.
         credentials={
             CONF_EMAIL: data.get(CONF_EMAIL),
             CONF_PASSWORD: data.get(CONF_PASSWORD),
-            CONF_CODE: data.get(CONF_CODE),
         },
     )
 
@@ -185,37 +213,50 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         try:
             async with timeout(conf_timeout):
                 result = await hass.async_add_executor_job(api.update, conf_residences)
+        except LevitonAuthError as exception:
+            # Auth is not a transient cloud blip. Do not spend the grace
+            # period replaying a login that cannot succeed.
+            _async_persist_refreshed_auth(hass, config_entry, api)
+            raise ConfigEntryAuthFailed(exception.message) from exception
         except (
             LevitonException,
             TimeoutError,
             requests.exceptions.RequestException,
         ) as exception:
+            # A refreshed bearer is worth keeping even when the data fetch
+            # itself failed, so the next retry does not log in again.
+            _async_persist_refreshed_auth(hass, config_entry, api)
             consecutive_failures += 1
-
-            # Serve the last known data for a few cycles so a transient cloud
-            # fault does not take every entity unavailable for a whole poll.
-            if (
-                consecutive_failures <= MAX_TOLERATED_UPDATE_FAILURES
-                and coordinator.data is not None
-            ):
-                _LOGGER.warning(
-                    "Leviton update failed (%s of %s tolerated), serving last known data: %s",
-                    consecutive_failures,
-                    MAX_TOLERATED_UPDATE_FAILURES,
-                    exception,
-                )
+            # The first refresh has no snapshot to serve, so it fails
+            # immediately and setup becomes ConfigEntryNotReady. Later polls
+            # keep the last good data for two failures.
+            have_snapshot = coordinator.data is not None
+            within_grace = (
+                have_snapshot and consecutive_failures <= MAX_TOLERATED_UPDATE_FAILURES
+            )
+            _LOGGER.log(
+                logging.WARNING if consecutive_failures == 1 else logging.DEBUG,
+                "Leviton update failed (%s of %s tolerated)%s: %s",
+                consecutive_failures,
+                MAX_TOLERATED_UPDATE_FAILURES,
+                ", serving last known data" if within_grace else "",
+                exception,
+            )
+            if within_grace:
                 return coordinator.data
-
             if isinstance(exception, LevitonException):
                 raise UpdateFailed(
-                    f"Error communicating with API, Status: {exception.status_code}, Error Name: {exception.name}, Error Message: {exception.message}"
+                    "Error communicating with API, "
+                    f"Status: {exception.status_code}, "
+                    f"Error Name: {exception.name}, "
+                    f"Error Message: {exception.message}"
                 ) from exception
-
             raise UpdateFailed(
                 f"Error communicating with API: {exception!r}"
             ) from exception
 
         consecutive_failures = 0
+        _async_persist_refreshed_auth(hass, config_entry, api)
         return result
 
     coordinator = LevitonDataUpdateCoordinator(
@@ -226,7 +267,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         update_interval=timedelta(minutes=conf_scan_interval),
         update_method=async_update_data,
     )
-    await coordinator.async_refresh()
+    # A failure here raises ConfigEntryNotReady (or ConfigEntryAuthFailed)
+    # instead of finishing setup with no entities.
+    await coordinator.async_config_entry_first_refresh()
 
     for residence in coordinator.data.residences:
         if residence.id and residence.id in conf_residences:
@@ -290,9 +333,9 @@ async def _async_start_websocket(
 
     @callback
     def token_provider() -> dict | None:
-        # Prefer the login response from the running session. The copy stored
-        # in the config entry is never rewritten after a re-login, so it goes
-        # stale and the WebSocket keeps authenticating with a dead token.
+        # Prefer the login response from the running session. A successful
+        # re-login also writes that bearer back onto the config entry so a
+        # restart does not keep presenting the expired token.
         live = api.login_response
         if isinstance(live, dict) and live.get("id"):
             return live
@@ -390,3 +433,80 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
 async def async_update_listener(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
     """Handle options update."""
     await hass.config_entries.async_reload(config_entry.entry_id)
+
+
+def _async_persist_refreshed_auth(
+    hass: HomeAssistant, config_entry: ConfigEntry, api: LevitonAPI
+) -> None:
+    """Store a refreshed bearer and drop any one-time 2FA code.
+
+    Called from the coordinator, including the first refresh, which runs
+    before the update listener is registered. A later change notifies that
+    listener and reloads the entry once.
+    """
+    data = dict(config_entry.data)
+    changed = False
+
+    if CONF_CODE in data:
+        data.pop(CONF_CODE)
+        changed = True
+
+    if api.authorization and data.get(CONF_TOKEN) != api.authorization:
+        data[CONF_TOKEN] = api.authorization
+        changed = True
+
+    if api.user_id and data.get(CONF_ID) != api.user_id:
+        data[CONF_ID] = api.user_id
+        changed = True
+
+    if isinstance(api.login_response, dict):
+        stored = login_response_for_storage(api.login_response)
+        if data.get(CONF_LOGIN_RESPONSE) != stored:
+            data[CONF_LOGIN_RESPONSE] = stored
+            changed = True
+    elif isinstance(data.get(CONF_LOGIN_RESPONSE), dict):
+        stored = login_response_for_storage(data[CONF_LOGIN_RESPONSE])
+        if data[CONF_LOGIN_RESPONSE] != stored:
+            data[CONF_LOGIN_RESPONSE] = stored
+            changed = True
+
+    if changed:
+        hass.config_entries.async_update_entry(config_entry, data=data)
+
+
+def _reported_identifiers(data: LevitonData) -> set[tuple[str, str]]:
+    """Return device-registry identifiers present in the latest account data."""
+    identifiers: set[tuple[str, str]] = set()
+    for residence in data.residences:
+        if residence.id is not None:
+            identifiers.add(generate_device_identifier(residence.id))
+        for device in residence.devices:
+            if device.id is not None:
+                identifiers.add(generate_device_identifier(device.id))
+    return identifiers
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Allow removal only when the account no longer reports the device.
+
+    Home Assistant calls this when the user deletes a device in the UI.
+    Returning False keeps a device that the My Leviton account still lists.
+    """
+    domain_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id)
+    if not domain_data:
+        return False
+    coordinator: LevitonDataUpdateCoordinator | None = domain_data.get(DATA_COORDINATOR)
+    if coordinator is None or coordinator.data is None:
+        return False
+
+    reported = _reported_identifiers(coordinator.data)
+    ours = {
+        identifier
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+    }
+    if not ours:
+        return False
+    return ours.isdisjoint(reported)

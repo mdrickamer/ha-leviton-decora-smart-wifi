@@ -25,6 +25,16 @@ triggers:
 
 *Note: Leviton's API only emits `btnPress` notifications for buttons that have at least one action configured in the MyLeviton mobile app. Bind each button you want to expose in Home Assistant to any placeholder action in the MyLeviton app, the button itself doesn't need to do anything meaningful for Home Assistant to receive the press.*
 
+## Install this fork
+This repository is a personal fork of [schmittx/home-assistant-leviton-decora-smart-wifi](https://github.com/schmittx/home-assistant-leviton-decora-smart-wifi) (upstream 2.2.2). The integration domain is still `leviton_decora_smart_wifi`, so an existing config entry, its devices, and its entity unique ids carry over. There is no user migration step.
+
+1. In HACS, remove or disable the upstream Leviton Decora Smart Wi-Fi repository first. Leaving both installed puts two copies of the same domain on disk.
+2. Add this repository as a [HACS custom repository](https://hacs.xyz/docs/faq/custom_repositories) (category: Integration) and download it. Home Assistant 2026.8.0 or newer is required.
+3. Restart Home Assistant.
+4. The existing entry should load on its own. A reauthentication prompt appears only when the saved login is rejected (expired token, or two-factor authentication that cannot be refreshed with the stored password). A one-time 2FA code is not reused.
+
+Version 2.3.0 is a reliability release. After startup, a timeout, connection error, or HTTP 5xx keeps the last good state for two polls and marks entities unavailable on the third. A failed login still asks you to reauthenticate immediately. See `CHANGELOG.md`.
+
 ## Install
 1. Ensure Home Assistant is updated to version 2026.8.0 or newer.
 2. Use HACS and add as a [custom repo](https://hacs.xyz/docs/faq/custom_repositories); or download and manually move to the `custom_components` folder.
