@@ -39,3 +39,7 @@ jobs:
         with:
           category: integration
           comment: "false"
+          # This fork does not publish to the default HACS store, so the
+          # repository-metadata checks (issues enabled, GitHub topics) are
+          # skipped. Integration manifest and structure checks still run.
+          ignore: issues topics
